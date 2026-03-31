@@ -2,6 +2,11 @@ require('dotenv').config();
 const express = require('express');
 const axios = require('axios');
 const mongoose = require('mongoose');
+const { GoogleGenerativeAI } = require('@google/generative-ai');
+
+const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
+const gemini = genAI.getGenerativeModel({ model: 'gemini-2.5-flash' });
+if (process.env.GEMINI_API_KEY) console.log('✅ Gemini connected');
 
 const app = express();
 
@@ -14,17 +19,21 @@ const PORT = process.env.PORT || 3000;
 
 // ---------------- MONGODB ----------------
 
-mongoose.connect(process.env.DB_URL.replace('/?', '/aapki_pooja?'))
+mongoose
+  .connect(process.env.DB_URL.replace('/?', '/aapki_pooja?'))
   .then(() => console.log('✅ MongoDB connected'))
   .catch(err => console.error('❌ MongoDB error:', err.message));
 
-const productSchema = new mongoose.Schema({
-  id: String,
-  name: String,
-  quantity: Number,
-  color: String,
-  size: String,
-}, { collection: 'products' });
+const productSchema = new mongoose.Schema(
+  {
+    id: String,
+    name: String,
+    quantity: Number,
+    color: String,
+    size: String,
+  },
+  { collection: 'products' },
+);
 
 const Product = mongoose.model('Product', productSchema);
 
@@ -69,7 +78,6 @@ app.post('/webhook', async (req, res) => {
   res.sendStatus(200);
 
   console.log('--- INCOMING WEBHOOK ---');
-  console.log(JSON.stringify(req.body, null, 2));
 
   const body = req.body;
 
@@ -91,23 +99,86 @@ app.post('/webhook', async (req, res) => {
 
       console.log('Message:', text);
 
-      const product = await Product.findOne({ id: text.trim().toUpperCase() });
+      // If message is already a product ID, skip Gemini
+      const directMatch = text
+        .trim()
+        .toUpperCase()
+        .match(/^[A-Z]\d{3}$/);
+      const productId = directMatch
+        ? directMatch[0]
+        : await extractProductId(text);
+      console.log('Extracted ID:', productId);
 
-      let reply;
-      if (product) {
-        if (product.quantity > 0) {
-          reply = `Yes, ${product.name} (${product.id}) is available (${product.quantity} pieces)`;
+      let productInfo = null;
+      if (productId) {
+        const product = await Product.findOne({ id: productId });
+        if (product) {
+          productInfo = { found: true, name: product.name, id: product.id, quantity: product.quantity };
         } else {
-          reply = `No, ${product.name} (${product.id}) is not available`;
+          productInfo = { found: false, id: productId };
         }
-      } else {
-        reply = `Product ID "${text.trim()}" not found`;
       }
 
+      const reply = await generateReply(text, productInfo);
       await sendMessage(senderId, reply);
     }
   }
 });
+
+// ---------------- GEMINI FUNCTIONS ----------------
+
+async function extractProductId(text) {
+  const prompt = `You are a product ID extractor. Extract the product ID from the message below. A product ID is a letter followed by exactly 3 digits (e.g. P001, S003, P002). The message may be in any language including Hindi/Hinglish. Reply with ONLY the product ID in uppercase (e.g. P001). If no product ID is found or mentioned, reply with ONLY the word "null". Do not add any explanation.
+
+Message: "${text}"`;
+
+  try {
+    const result = await gemini.generateContent(prompt);
+    const response = result.response.text().trim().toUpperCase();
+    const match = response.match(/[A-Z]\d{3}/);
+    if (match) return match[0];
+    return null;
+  } catch (err) {
+    console.error('❌ Gemini error:', err.message);
+    return null;
+  }
+}
+
+async function generateReply(userMessage, productInfo) {
+  let context;
+  if (!productInfo) {
+    context = `The user did not mention any product ID. Politely ask them to provide a product ID (format: letter + 3 digits, e.g. P001) so you can check availability.`;
+  } else if (!productInfo.found) {
+    context = `The user asked about product ID "${productInfo.id}" but it was not found in our catalog. Politely inform them.`;
+  } else if (productInfo.quantity > 0) {
+    context = `Product "${productInfo.name}" (ID: ${productInfo.id}) is available with ${productInfo.quantity} pieces in stock. Share this good news politely.`;
+  } else {
+    context = `Product "${productInfo.name}" (ID: ${productInfo.id}) is currently out of stock. Inform the user politely and apologize.`;
+  }
+
+  const prompt = `You are a friendly customer support assistant for an online clothing store called "Aapki Pooja".
+
+User message: "${userMessage}"
+Situation: ${context}
+
+Instructions:
+- Detect the language of the user message (Hindi, English, or Hinglish) and reply in the SAME language
+- Be polite, warm, and conversational
+- Keep the reply short (1-2 sentences max)
+- Do not use markdown, asterisks, or formatting — plain text only`;
+
+  try {
+    const result = await gemini.generateContent(prompt);
+    return result.response.text().trim();
+  } catch (err) {
+    console.error('❌ Gemini reply error:', err.message);
+    // Fallback to plain text if Gemini fails
+    if (!productInfo) return 'Please provide a product ID (e.g. P001) so I can check availability for you.';
+    if (!productInfo.found) return `Product ID "${productInfo.id}" not found.`;
+    if (productInfo.quantity > 0) return `Yes, ${productInfo.name} (${productInfo.id}) is available (${productInfo.quantity} pieces).`;
+    return `Sorry, ${productInfo.name} (${productInfo.id}) is currently out of stock.`;
+  }
+}
 
 // ---------------- SEND MESSAGE ----------------
 
@@ -127,7 +198,10 @@ async function sendMessage(id, text) {
     );
     console.log('✅ Reply sent successfully to:', id);
   } catch (error) {
-    console.error('❌ Error sending reply:', error.response?.data || error.message);
+    console.error(
+      '❌ Error sending reply:',
+      error.response?.data || error.message,
+    );
   }
 }
 
@@ -144,11 +218,14 @@ app.listen(PORT, async () => {
       await axios.post(
         `https://graph.instagram.com/v21.0/${INSTAGRAM_ACCOUNT_ID}/subscribed_apps`,
         { subscribed_fields: 'messages' },
-        { params: { access_token: PAGE_ACCESS_TOKEN } }
+        { params: { access_token: PAGE_ACCESS_TOKEN } },
       );
       console.log('✅ Instagram account subscribed to webhook messages');
     } catch (err) {
-      console.error('⚠️  Subscription error:', err.response?.data?.error?.message || err.message);
+      console.error(
+        '⚠️  Subscription error:',
+        err.response?.data?.error?.message || err.message,
+      );
     }
   }
 });
