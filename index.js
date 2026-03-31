@@ -1,6 +1,7 @@
 require('dotenv').config();
 const express = require('express');
 const axios = require('axios');
+const mongoose = require('mongoose');
 
 const app = express();
 
@@ -10,6 +11,22 @@ app.use(express.urlencoded({ extended: true }));
 const VERIFY_TOKEN = process.env.VERIFY_TOKEN;
 const PAGE_ACCESS_TOKEN = process.env.PAGE_ACCESS_TOKEN;
 const PORT = process.env.PORT || 3000;
+
+// ---------------- MONGODB ----------------
+
+mongoose.connect(process.env.DB_URL.replace('/?', '/aapki_pooja?'))
+  .then(() => console.log('✅ MongoDB connected'))
+  .catch(err => console.error('❌ MongoDB error:', err.message));
+
+const productSchema = new mongoose.Schema({
+  id: String,
+  name: String,
+  quantity: Number,
+  color: String,
+  size: String,
+}, { collection: 'products' });
+
+const Product = mongoose.model('Product', productSchema);
 
 // ---------------- TEST ROUTE ----------------
 
@@ -74,7 +91,20 @@ app.post('/webhook', async (req, res) => {
 
       console.log('Message:', text);
 
-      await sendMessage(senderId, text);
+      const product = await Product.findOne({ id: text.trim().toUpperCase() });
+
+      let reply;
+      if (product) {
+        if (product.quantity > 0) {
+          reply = `Yes, ${product.name} (${product.id}) is available (${product.quantity} pieces)`;
+        } else {
+          reply = `No, ${product.name} (${product.id}) is not available`;
+        }
+      } else {
+        reply = `Product ID "${text.trim()}" not found`;
+      }
+
+      await sendMessage(senderId, reply);
     }
   }
 });
